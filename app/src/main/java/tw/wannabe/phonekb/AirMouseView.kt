@@ -85,8 +85,10 @@ class AirMouseView(context: Context) : View(context), SensorEventListener {
 
     fun start() {
         if (running || gyro == null) return
-        sm?.registerListener(this, gyro, SensorManager.SENSOR_DELAY_FASTEST)
-        grav?.let { sm?.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        // 不能用 SENSOR_DELAY_FASTEST：Android 12+ 沒宣告 HIGH_SAMPLING_RATE_SENSORS 權限會直接閃退。
+        // 5000µs = 200Hz，是不需要額外權限的上限，對滑鼠已經很夠。
+        runCatching { sm?.registerListener(this, gyro, GYRO_PERIOD_US) }
+        grav?.let { g -> runCatching { sm?.registerListener(this, g, SensorManager.SENSOR_DELAY_GAME) } }
         running = true
         lastTs = 0L; wx = 0f; wy = 0f; wz = 0f; accX = 0f; accY = 0f
     }
@@ -302,6 +304,7 @@ class AirMouseView(context: Context) : View(context), SensorEventListener {
 
     companion object {
         private const val SMOOTH = 0.5f
+        private const val GYRO_PERIOD_US = 5000
         private const val DEADBAND = 0.03f        // rad/s ≈ 1.7°/s，低於這個當作手抖
         private const val COUNTS_PER_RAD = 800f   // 靈敏度 1.0 時，每轉 1 弧度（57°）約 800 counts × 曲線
     }
