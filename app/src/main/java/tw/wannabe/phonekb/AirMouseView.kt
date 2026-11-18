@@ -51,6 +51,13 @@ class AirMouseView(context: Context) : View(context), SensorEventListener {
     val hasGyro get() = gyro != null
     private var running = false
 
+    // 畫面上的診斷資訊：確認感測器有沒有在跑、有沒有送出移動
+    private var sensorStatus = "未啟動"
+    private var gyroEvents = 0
+    private var sentMoves = 0
+    private var lastMag = 0f
+    private var lastInvalidate = 0L
+
     // 感測器狀態
     private val up = floatArrayOf(0f, 0f, 1f)          // 重力反方向（手機座標）
     private var wx = 0f; private var wy = 0f; private var wz = 0f   // 平滑後角速度 rad/s
@@ -85,9 +92,10 @@ class AirMouseView(context: Context) : View(context), SensorEventListener {
 
     fun start() {
         if (running || gyro == null) return
-        // 不能用 SENSOR_DELAY_FASTEST：Android 12+ 沒宣告 HIGH_SAMPLING_RATE_SENSORS 權限會直接閃退。
-        // 5000µs = 200Hz，是不需要額外權限的上限，對滑鼠已經很夠。
-        runCatching { sm?.registerListener(this, gyro, GYRO_PERIOD_US) }
+        // 用 SENSOR_DELAY_GAME（約 50Hz）：跟滑鼠回報率一樣，不需要任何特殊權限，各廠牌都支援。
+        sensorStatus = try {
+            if (sm?.registerListener(this, gyro, SensorManager.SENSOR_DELAY_GAME) == true) "OK" else "註冊失敗"
+        } catch (e: Exception) { "錯誤：${e.javaClass.simpleName}" }
         grav?.let { g -> runCatching { sm?.registerListener(this, g, SensorManager.SENSOR_DELAY_GAME) } }
         running = true
         lastTs = 0L; wx = 0f; wy = 0f; wz = 0f; accX = 0f; accY = 0f
@@ -113,6 +121,9 @@ class AirMouseView(context: Context) : View(context), SensorEventListener {
     }
 
     private fun onGyro(e: SensorEvent) {
+        gyroEvents++
+        val nowMs = android.os.SystemClock.uptimeMillis()
+        if (nowMs - lastInvalidate > 150) { lastInvalidate = nowMs; invalidate() }
         if (lastTs == 0L) { lastTs = e.timestamp; return }
         val dt = ((e.timestamp - lastTs) * 1e-9f).coerceIn(0f, 0.05f)
         lastTs = e.timestamp
@@ -138,6 +149,7 @@ class AirMouseView(context: Context) : View(context), SensorEventListener {
         val yaw = wx * up[0] + wy * up[1] + wz * up[2]       // 正 = 往左轉
         val pitch = wx * rx + wy * ry + wz * rz              // 正 = 往上抬
         val mag = hypot(yaw, pitch)
+        lastMag = mag
         if (mag < DEADBAND) return
 
         // 速度曲線：慢轉精準（抑制手抖）、快轉跨得遠
@@ -148,6 +160,7 @@ class AirMouseView(context: Context) : View(context), SensorEventListener {
         val ix = accX.toInt(); val iy = accY.toInt()
         if (ix == 0 && iy == 0) return
         accX -= ix; accY -= iy
+        sentMoves++
         listener?.onMouseReport(buttons, ix, iy, 0, 0)
     }
 
@@ -204,6 +217,8 @@ class AirMouseView(context: Context) : View(context), SensorEventListener {
         }
         label(rC, hint, 18f * density, Color.WHITE, -14f * density)
         label(rC, "按住這裡＝暫停（像把滑鼠拿起來）", 13f * density, Color.parseColor("#9AA0A6"), 18f * density)
+        label(rC, "感測器：$sensorStatus · 事件 $gyroEvents · 角速度 %.2f · 已送 $sentMoves".format(lastMag),
+            11f * density, Color.parseColor("#6B7078"), 46f * density)
 
         block(rK, false, Color.parseColor("#1E1F22")); label(rK, "⌨ 鍵盤", 18f * density)
         block(rT, false, if (moving) Color.parseColor("#2F6B44") else Color.parseColor("#5A2A2C"))
@@ -304,7 +319,6 @@ class AirMouseView(context: Context) : View(context), SensorEventListener {
 
     companion object {
         private const val SMOOTH = 0.5f
-        private const val GYRO_PERIOD_US = 5000
         private const val DEADBAND = 0.03f        // rad/s ≈ 1.7°/s，低於這個當作手抖
         private const val COUNTS_PER_RAD = 800f   // 靈敏度 1.0 時，每轉 1 弧度（57°）約 800 counts × 曲線
     }
