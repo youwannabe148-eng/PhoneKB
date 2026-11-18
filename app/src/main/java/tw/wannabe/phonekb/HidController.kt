@@ -319,48 +319,118 @@ class HidController(private val context: Context, private val listener: Listener
         }
     }
 
-    // ---- 滑鼠：移動量先累積，最快每 MOUSE_INTERVAL_MS 送一包 ----
-    // 觸控事件一秒 100+ 次，每次都送會讓藍牙佇列塞車 → 延遲越積越大。
-    // 按鍵狀態改變（點擊、拖曳）則立刻送，不等。
+    // ---- 滑鼠移動：重新取樣（resampling）----
     /**
-     * 滑鼠最快多久送一包。送太快（例如 8ms = 125Hz）超過藍牙實際吞吐量時，
-     * 送不出去的 report 會在系統佇列裡排隊 → 延遲越拖越長。預設 20ms = 50Hz。
+     * 為什麼不能「收到就送」或「累積到時間就送」：
+     *  1. 觸控（約 120Hz）、陀螺儀（約 50Hz）的事件間隔本身會抖，跟送出的節拍對不齊，
+     *     每包的移動量就會忽大忽小 → 游標跳。
+     *  2. 送得比 iPad 螢幕的 60Hz 還慢（例如 50Hz）→ 有些畫面格完全沒收到移動 → 一頓一頓。
+     * 做法：把輸入記成「(時間, 累積位置)」的軌跡，固定每 mouseIntervalMs 一拍，
+     *       取「RESAMPLE_DELAY 之前」那一刻的內插位置，送出和上一拍的差。
+     *       每包移動量 ≈ 速度 × 間隔，非常平均；代價是多約 30ms 延遲。
+     * 按鍵（點擊、拖曳開始/結束）不等節拍：先把軌跡全部補送完，再立刻送按鍵狀態。
+     * 滾輪也立刻送。
      */
-    @Volatile var mouseIntervalMs = 20L
-    private var accDx = 0; private var accDy = 0; private var accWheel = 0; private var accPan = 0
+    @Volatile var mouseIntervalMs = 12L
+    private class Sample(val t: Long, val x: Long, val y: Long)
+    private val samples = ArrayDeque<Sample>()
+    private var cumX = 0L; private var cumY = 0L   // 輸入的累積位置
+    private var outX = 0L; private var outY = 0L   // 已送出的累積位置
+    private var lastInputNs = 0L
+    private var ticker: java.util.concurrent.ScheduledFuture<*>? = null
     private var curButtons = 0
-    private var flushScheduled = false
-    private var lastMouseSend = 0L
 
     fun sendMouse(buttons: Int, dx: Int, dy: Int, wheel: Int = 0, pan: Int = 0) {
         sender.execute {
+            val now = System.nanoTime()
             if (buttons != curButtons) {
-                flushMouse()                 // 先把舊按鍵狀態下的移動送完
+                addMotion(now, dx, dy)
+                catchUp()                    // 舊按鍵狀態下的移動全部送完
                 curButtons = buttons
-                accDx += dx; accDy += dy; accWheel += wheel; accPan += pan
-                flushMouse(force = true)     // 按鍵變化立刻送
-            } else {
-                accDx += dx; accDy += dy; accWheel += wheel; accPan += pan
-                scheduleMouse()
+                rawMouse(0, 0, wheel, pan)   // 立刻送新的按鍵狀態
+                return@execute
+            }
+            if (wheel != 0 || pan != 0) rawMouse(0, 0, wheel, pan)
+            if (dx != 0 || dy != 0) {
+                addMotion(now, dx, dy)
+                ensureTicker()
             }
         }
     }
 
-    private fun scheduleMouse() {
-        if (flushScheduled) return
-        flushScheduled = true
-        val wait = (lastMouseSend + mouseIntervalMs - System.currentTimeMillis()).coerceAtLeast(0)
-        sender.schedule({ flushScheduled = false; flushMouse() }, wait, TimeUnit.MILLISECONDS)
+    private fun addMotion(now: Long, dx: Int, dy: Int) {
+        if (dx == 0 && dy == 0) return
+        if (samples.isEmpty() || now - lastInputNs > IDLE_GAP_NS) {
+            // 停了一陣子才又開始動：補一個起點，讓第一段移動也平均分散送出
+            samples.clear()
+            samples.addLast(Sample(now - START_SPREAD_NS, cumX, cumY))
+        }
+        cumX += dx; cumY += dy
+        samples.addLast(Sample(now, cumX, cumY))
+        lastInputNs = now
     }
 
-    private fun flushMouse(force: Boolean = false) {
-        if (!force && accDx == 0 && accDy == 0 && accWheel == 0 && accPan == 0) return
-        val sx = accDx.coerceIn(-127, 127); val sy = accDy.coerceIn(-127, 127)
-        val sw = accWheel.coerceIn(-127, 127); val sp = accPan.coerceIn(-127, 127)
-        accDx -= sx; accDy -= sy; accWheel -= sw; accPan -= sp
-        raw(Hid.ID_MOUSE, byteArrayOf(curButtons.toByte(), sx.toByte(), sy.toByte(), sw.toByte(), sp.toByte()))
-        lastMouseSend = System.currentTimeMillis()
-        if (accDx != 0 || accDy != 0 || accWheel != 0 || accPan != 0) scheduleMouse()
+    /** 軌跡在時間 t 的位置（線性內插） */
+    private fun posAt(t: Long): DoubleArray {
+        if (samples.isEmpty()) return doubleArrayOf(cumX.toDouble(), cumY.toDouble())
+        val first = samples.first()
+        val last = samples.last()
+        if (t <= first.t) return doubleArrayOf(first.x.toDouble(), first.y.toDouble())
+        if (t >= last.t) return doubleArrayOf(last.x.toDouble(), last.y.toDouble())
+        for (i in 0 until samples.size - 1) {
+            val a = samples[i]
+            val b = samples[i + 1]
+            if (t < b.t) {
+                val k = (t - a.t).toDouble() / (b.t - a.t).coerceAtLeast(1L).toDouble()
+                return doubleArrayOf(a.x + (b.x - a.x) * k, a.y + (b.y - a.y) * k)
+            }
+        }
+        return doubleArrayOf(last.x.toDouble(), last.y.toDouble())
+    }
+
+    private fun ensureTicker() {
+        if (ticker != null) return
+        val period = mouseIntervalMs.coerceIn(5L, 50L)
+        ticker = sender.scheduleAtFixedRate({
+            try { tick() } catch (_: Exception) { }   // 例外會讓 fixedRate 永久停止，一定要接住
+        }, 0L, period, TimeUnit.MILLISECONDS)
+    }
+
+    private fun tick() {
+        val now = System.nanoTime()
+        val t = now - RESAMPLE_DELAY_NS
+        val p = posAt(t)
+        val dx = (Math.round(p[0]) - outX).coerceIn(-127L, 127L)
+        val dy = (Math.round(p[1]) - outY).coerceIn(-127L, 127L)
+        if (dx != 0L || dy != 0L) {
+            outX += dx; outY += dy
+            rawMouse(dx.toInt(), dy.toInt(), 0, 0)
+        }
+        // 丟掉用不到的舊樣本（保留 t 之前的最後一筆供內插）
+        while (samples.size > 2 && samples[1].t <= t) samples.removeFirst()
+        // 輸入停了、也全部送完 → 停止節拍（省電，也讓低延遲模式的 keepalive 接手）
+        if (now - lastInputNs > RESAMPLE_DELAY_NS + IDLE_GAP_NS && outX == cumX && outY == cumY) {
+            ticker?.cancel(false)
+            ticker = null
+        }
+    }
+
+    /** 把還沒送的移動立刻全部送完（按鍵狀態改變前用） */
+    private fun catchUp() {
+        while (outX != cumX || outY != cumY) {
+            val dx = (cumX - outX).coerceIn(-127L, 127L)
+            val dy = (cumY - outY).coerceIn(-127L, 127L)
+            outX += dx; outY += dy
+            rawMouse(dx.toInt(), dy.toInt(), 0, 0)
+        }
+        samples.clear()
+    }
+
+    private fun rawMouse(dx: Int, dy: Int, wheel: Int, pan: Int) {
+        raw(Hid.ID_MOUSE, byteArrayOf(
+            curButtons.toByte(), dx.toByte(), dy.toByte(),
+            wheel.coerceIn(-127, 127).toByte(), pan.coerceIn(-127, 127).toByte()
+        ))
     }
 
     fun releaseAll() {
@@ -392,5 +462,8 @@ class HidController(private val context: Context, private val listener: Listener
     companion object {
         private const val KEY_LAST = "last_device"
         private const val KEEPALIVE_MS = 80L
+        private const val RESAMPLE_DELAY_NS = 30_000_000L   // 30ms：要大於最慢輸入（陀螺儀約 20ms）的間隔
+        private const val IDLE_GAP_NS = 100_000_000L        // 停 100ms 以上算新的一段移動
+        private const val START_SPREAD_NS = 16_000_000L
     }
 }
