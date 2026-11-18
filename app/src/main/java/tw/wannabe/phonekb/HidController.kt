@@ -322,6 +322,11 @@ class HidController(private val context: Context, private val listener: Listener
     // ---- 滑鼠：移動量先累積，最快每 MOUSE_INTERVAL_MS 送一包 ----
     // 觸控事件一秒 100+ 次，每次都送會讓藍牙佇列塞車 → 延遲越積越大。
     // 按鍵狀態改變（點擊、拖曳）則立刻送，不等。
+    /**
+     * 滑鼠最快多久送一包。送太快（例如 8ms = 125Hz）超過藍牙實際吞吐量時，
+     * 送不出去的 report 會在系統佇列裡排隊 → 延遲越拖越長。預設 20ms = 50Hz。
+     */
+    @Volatile var mouseIntervalMs = 20L
     private var accDx = 0; private var accDy = 0; private var accWheel = 0; private var accPan = 0
     private var curButtons = 0
     private var flushScheduled = false
@@ -344,7 +349,7 @@ class HidController(private val context: Context, private val listener: Listener
     private fun scheduleMouse() {
         if (flushScheduled) return
         flushScheduled = true
-        val wait = (lastMouseSend + MOUSE_INTERVAL_MS - System.currentTimeMillis()).coerceAtLeast(0)
+        val wait = (lastMouseSend + mouseIntervalMs - System.currentTimeMillis()).coerceAtLeast(0)
         sender.schedule({ flushScheduled = false; flushMouse() }, wait, TimeUnit.MILLISECONDS)
     }
 
@@ -386,7 +391,6 @@ class HidController(private val context: Context, private val listener: Listener
 
     companion object {
         private const val KEY_LAST = "last_device"
-        private const val MOUSE_INTERVAL_MS = 8L    // ≈ 125 Hz，和觸控取樣同步，避免一包一筆、一包兩筆的不均勻
         private const val KEEPALIVE_MS = 80L
     }
 }

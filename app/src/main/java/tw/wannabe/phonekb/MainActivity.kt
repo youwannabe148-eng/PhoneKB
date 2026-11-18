@@ -49,6 +49,7 @@ class MainActivity : Activity(), HidController.Listener {
 
         hid = HidController(applicationContext, this)
         hid.lowLatency = prefs.getBoolean("lowlat", true)
+        hid.mouseIntervalMs = 1000L / prefs.getInt("mouse_hz", 50)
 
         keyboard = KeyboardView(this).apply {
             mode = runCatching { KbMode.valueOf(prefs.getString("mode", "ZHUYIN")!!) }
@@ -318,6 +319,27 @@ class MainActivity : Activity(), HidController.Listener {
                 touchpad.invertScroll = c; airMouse.invertScroll = c
                 prefs.edit().putBoolean("invert", c).apply()
             }
+        })
+
+        // ---- 滑鼠回報率 ----
+        val hzLabel = label("")
+        fun updHz(hz: Int) { hzLabel.text = "滑鼠回報率：$hz 次/秒（延遲大就調低，不順就調高）" }
+        val hz0 = prefs.getInt("mouse_hz", 50)
+        updHz(hz0)
+        box.addView(hzLabel)
+        box.addView(SeekBar(this).apply {
+            max = 18  // 30 ~ 120，每格 5
+            progress = (hz0 - 30) / 5
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                    val hz = 30 + p * 5
+                    hid.mouseIntervalMs = 1000L / hz
+                    updHz(hz)
+                    prefs.edit().putInt("mouse_hz", hz).apply()
+                }
+                override fun onStartTrackingTouch(s: SeekBar) {}
+                override fun onStopTrackingTouch(s: SeekBar) {}
+            })
         })
 
         // ---- 滑鼠模式 ----
