@@ -7,6 +7,7 @@ import android.app.AlertDialog
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Build
@@ -22,6 +23,8 @@ import android.widget.Button
 import android.widget.CheckBox
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
@@ -33,6 +36,8 @@ class MainActivity : Activity(), HidController.Listener {
     private lateinit var hid: HidController
     private lateinit var keyboard: KeyboardView
     private lateinit var touchpad: TouchpadView
+    private lateinit var airMouse: AirMouseView
+    private val useAirMouse get() = prefs.getString("mouse_mode", "pad") == "air"
     private val prefs by lazy { getSharedPreferences("ui", MODE_PRIVATE) }
     private var settingsDialog: AlertDialog? = null
     private var statusText: TextView? = null
@@ -68,10 +73,22 @@ class MainActivity : Activity(), HidController.Listener {
             }
         }
 
+        airMouse = AirMouseView(this).apply {
+            sensitivity = prefs.getFloat("air_sens", 1.0f)
+            invertScroll = prefs.getBoolean("invert", false)
+            visibility = View.GONE
+            listener = object : TouchpadView.Listener {
+                override fun onMouseReport(buttons: Int, dx: Int, dy: Int, wheel: Int, pan: Int) =
+                    hid.sendMouse(buttons, dx, dy, wheel, pan)
+                override fun onKeyAction(action: KeyAction) = handleAction(action)
+            }
+        }
+
         val root = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             addView(keyboard, FrameLayout.LayoutParams(-1, -1))
             addView(touchpad, FrameLayout.LayoutParams(-1, -1))
+            addView(airMouse, FrameLayout.LayoutParams(-1, -1))
         }
         // 避開鏡頭挖孔（橫向時在左右邊）
         root.setOnApplyWindowInsetsListener { v, insets ->
@@ -161,6 +178,7 @@ class MainActivity : Activity(), HidController.Listener {
         }
         keyboard.statusColor = color
         touchpad.statusColor = color
+        airMouse.statusColor = color
         statusText?.text = statusString()
         if (state == HidController.State.CONNECTED) toast("已連線：${hid.deviceName(device)}")
         if (state == HidController.State.ERROR) toast(hid.errorText)
@@ -191,11 +209,22 @@ class MainActivity : Activity(), HidController.Listener {
             KeyAction.TOUCHPAD -> {
                 keyboard.releaseAll()
                 keyboard.visibility = View.GONE
-                touchpad.visibility = View.VISIBLE
+                if (useAirMouse) {
+                    // 體感滑鼠：手機直拿，像遙控器一樣指著螢幕
+                    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    airMouse.visibility = View.VISIBLE
+                    airMouse.start()
+                    if (!airMouse.hasGyro) toast("這支手機沒有陀螺儀，請改用觸控板")
+                } else {
+                    touchpad.visibility = View.VISIBLE
+                }
             }
             KeyAction.KEYBOARD -> {
                 touchpad.releaseAll()
                 touchpad.visibility = View.GONE
+                airMouse.stop()
+                airMouse.visibility = View.GONE
+                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                 keyboard.visibility = View.VISIBLE
             }
             KeyAction.SETTINGS -> showSettings()
@@ -286,8 +315,39 @@ class MainActivity : Activity(), HidController.Listener {
             text = "反轉捲動方向"
             isChecked = touchpad.invertScroll
             setOnCheckedChangeListener { _, c ->
-                touchpad.invertScroll = c; prefs.edit().putBoolean("invert", c).apply()
+                touchpad.invertScroll = c; airMouse.invertScroll = c
+                prefs.edit().putBoolean("invert", c).apply()
             }
+        })
+
+        // ---- 滑鼠模式 ----
+        box.addView(label("按 🖱 時使用：", 15f))
+        val rg = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
+        val rbPad = RadioButton(this).apply { text = "觸控板"; id = View.generateViewId() }
+        val rbAir = RadioButton(this).apply { text = "體感滑鼠（轉動手機移動）"; id = View.generateViewId() }
+        rg.addView(rbPad); rg.addView(rbAir)
+        rg.check(if (useAirMouse) rbAir.id else rbPad.id)
+        rg.setOnCheckedChangeListener { _, checked ->
+            prefs.edit().putString("mouse_mode", if (checked == rbAir.id) "air" else "pad").apply()
+        }
+        box.addView(rg)
+        val airLabel = label("")
+        fun updAir(v: Float) { airLabel.text = "體感滑鼠靈敏度：%.1f".format(v) }
+        updAir(airMouse.sensitivity)
+        box.addView(airLabel)
+        box.addView(SeekBar(this).apply {
+            max = 25  // 0.3 ~ 2.8
+            progress = ((airMouse.sensitivity - 0.3f) * 10).toInt()
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                    val v = 0.3f + p / 10f
+                    airMouse.sensitivity = v
+                    updAir(v)
+                    prefs.edit().putFloat("air_sens", v).apply()
+                }
+                override fun onStartTrackingTouch(s: SeekBar) {}
+                override fun onStopTrackingTouch(s: SeekBar) {}
+            })
         })
         box.addView(label("連線紀錄（有問題時截圖這段）："))
         logView = TextView(this).apply {
@@ -337,6 +397,7 @@ class MainActivity : Activity(), HidController.Listener {
         super.onResume()
         if (hid.state == HidController.State.OFF && hasPermissions() && hid.adapter?.isEnabled == true) hid.start()
         hid.setForeground(true)
+        if (airMouse.visibility == View.VISIBLE) airMouse.start()
     }
 
     override fun onPause() {
@@ -344,6 +405,7 @@ class MainActivity : Activity(), HidController.Listener {
         hid.setForeground(false)
         keyboard.releaseAll()
         touchpad.releaseAll()
+        airMouse.stop()
     }
 
     override fun onDestroy() {
