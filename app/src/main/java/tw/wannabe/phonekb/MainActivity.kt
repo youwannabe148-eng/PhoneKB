@@ -10,7 +10,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Build
+import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.view.WindowInsets
@@ -34,12 +36,14 @@ class MainActivity : Activity(), HidController.Listener {
     private val prefs by lazy { getSharedPreferences("ui", MODE_PRIVATE) }
     private var settingsDialog: AlertDialog? = null
     private var statusText: TextView? = null
+    private var logView: TextView? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         hid = HidController(applicationContext, this)
+        hid.lowLatency = prefs.getBoolean("lowlat", true)
 
         keyboard = KeyboardView(this).apply {
             mode = runCatching { KbMode.valueOf(prefs.getString("mode", "ZHUYIN")!!) }
@@ -92,6 +96,10 @@ class MainActivity : Activity(), HidController.Listener {
             arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE)
         else emptyArray()
 
+    private fun hasPermissions() = neededPermissions().all {
+        checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+    }
+
     private fun ensurePermissionsThenStart() {
         val missing = neededPermissions().filter {
             checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
@@ -102,8 +110,20 @@ class MainActivity : Activity(), HidController.Listener {
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
         if (code != REQ_PERM) return
-        if (results.isNotEmpty() && results.all { it == PackageManager.PERMISSION_GRANTED }) startBluetooth()
-        else toast("需要「附近的裝置」權限才能當藍牙鍵盤")
+        if (results.isNotEmpty() && results.all { it == PackageManager.PERMISSION_GRANTED }) {
+            startBluetooth()
+        } else {
+            statusText?.text = statusString()
+            // 被拒絕且勾了「不再詢問」→ 系統不會再跳視窗，直接帶去 App 設定頁
+            val blocked = perms.any { !shouldShowRequestPermissionRationale(it) }
+            if (blocked) {
+                toast("請在「權限 › 附近的裝置」選允許（不是定位）")
+                startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.fromParts("package", packageName, null)))
+            } else {
+                toast("需要「附近的裝置」權限才能當藍牙鍵盤（不需要定位）")
+            }
+        }
     }
 
     private fun startBluetooth() {
@@ -145,6 +165,10 @@ class MainActivity : Activity(), HidController.Listener {
         if (state == HidController.State.ERROR) toast(hid.errorText)
     }
 
+    override fun onLog() {
+        logView?.text = hid.logText()
+    }
+
     override fun onLeds(leds: Int) {
         keyboard.capsOn = (leds and 0x02) != 0
     }
@@ -155,7 +179,8 @@ class MainActivity : Activity(), HidController.Listener {
         HidController.State.READY -> "● 等待連線（第一次請先配對）"
         HidController.State.REGISTERING -> "● 啟動中…"
         HidController.State.ERROR -> "● 錯誤：${hid.errorText}"
-        HidController.State.OFF -> "● 藍牙未啟動"
+        HidController.State.OFF ->
+            if (!hasPermissions()) "● 未啟動：缺少「附近的裝置」權限（按下方按鈕）" else "● 藍牙未啟動"
     }
 
     // ---------------------------------------------------------------- UI
@@ -205,6 +230,12 @@ class MainActivity : Activity(), HidController.Listener {
             setOnClickListener { hid.stop(); hid.start() }
         })
         box.addView(row)
+        if (!hasPermissions()) {
+            box.addView(Button(this).apply {
+                text = "開啟「附近的裝置」權限"
+                setOnClickListener { ensurePermissionsThenStart() }
+            })
+        }
 
         box.addView(label("已配對裝置（點一下連線）："))
         val bonded = hid.bondedDevices()
@@ -237,12 +268,27 @@ class MainActivity : Activity(), HidController.Listener {
             })
         })
         box.addView(CheckBox(this).apply {
+            text = "低延遲模式（保持藍牙清醒，較耗電）"
+            isChecked = hid.lowLatency
+            setOnCheckedChangeListener { _, c ->
+                hid.lowLatency = c; prefs.edit().putBoolean("lowlat", c).apply()
+            }
+        })
+        box.addView(CheckBox(this).apply {
             text = "反轉捲動方向"
             isChecked = touchpad.invertScroll
             setOnCheckedChangeListener { _, c ->
                 touchpad.invertScroll = c; prefs.edit().putBoolean("invert", c).apply()
             }
         })
+        box.addView(label("連線紀錄（有問題時截圖這段）："))
+        logView = TextView(this).apply {
+            typeface = android.graphics.Typeface.MONOSPACE
+            textSize = 11f
+            setTextIsSelectable(true)
+            text = hid.logText()
+        }
+        box.addView(logView)
         box.addView(label(
             "第一次使用：按「讓平板找到我」→ 平板 設定 › 藍牙 → 點這支手機配對。\n" +
             "之後打開 App 會自動重連上一台。\n" +
@@ -253,7 +299,7 @@ class MainActivity : Activity(), HidController.Listener {
         settingsDialog = AlertDialog.Builder(this)
             .setView(ScrollView(this).apply { addView(box) })
             .setPositiveButton("關閉", null)
-            .setOnDismissListener { statusText = null; hideSystemBars() }
+            .setOnDismissListener { statusText = null; logView = null; hideSystemBars() }
             .show()
     }
 
@@ -279,8 +325,15 @@ class MainActivity : Activity(), HidController.Listener {
         if (hasFocus) hideSystemBars()
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (hid.state == HidController.State.OFF && hasPermissions() && hid.adapter?.isEnabled == true) hid.start()
+        hid.setForeground(true)
+    }
+
     override fun onPause() {
         super.onPause()
+        hid.setForeground(false)
         keyboard.releaseAll()
         touchpad.releaseAll()
     }
