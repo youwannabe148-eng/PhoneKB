@@ -35,6 +35,8 @@ class TouchpadView(context: Context) : View(context) {
     var listener: Listener? = null
     var sensitivity = 1.5f
     var invertScroll = false
+    /** iPad / Windows 自己就有游標加速，預設關掉避免加速兩次 */
+    var acceleration = false
     var statusColor = KeyboardView.COLOR_RED
         set(v) { field = v; invalidate() }
 
@@ -59,6 +61,9 @@ class TouchpadView(context: Context) : View(context) {
     private var dragging = false
     private var multiTouchSeen = false
     private var accX = 0f; private var accY = 0f
+    private var lastMoveTime = 0L
+    private var startMoved = false  // 手指要先移動超過 START_SLOP 才開始動游標（防抖、防點擊時偏移）
+    private var slopX = 0f; private var slopY = 0f
     private var scrollAccX = 0f; private var scrollAccY = 0f
 
     private val buttons get() = barButtons or (if (dragging) 1 else 0)
@@ -158,6 +163,8 @@ class TouchpadView(context: Context) : View(context) {
             moved = 0f
             multiTouchSeen = false
             accX = 0f; accY = 0f; scrollAccX = 0f; scrollAccY = 0f
+            startMoved = false; slopX = 0f; slopY = 0f
+            lastMoveTime = SystemClock.uptimeMillis()
             // 點一下後很快再按住 → 拖移
             if (now - lastTapUp < DOUBLE_TAP_MS &&
                 hypot(x - lastTapPos.x, y - lastTapPos.y) < 60f * density) {
@@ -186,17 +193,34 @@ class TouchpadView(context: Context) : View(context) {
         if (n >= 2) {
             scroll(dx, dy)
         } else if (!multiTouchSeen) {   // 雙指放開剩一指時不要亂動游標
-            move(dx, dy)
+            val now = e.eventTime
+            val dt = (now - lastMoveTime).coerceIn(1L, 50L)
+            lastMoveTime = now
+            if (!startMoved) {
+                slopX += dx; slopY += dy
+                if (hypot(slopX, slopY) / density < START_SLOP_DP) return
+                startMoved = true
+                move(slopX, slopY, dt)   // 超過門檻後把累積的一次補上，不會跳
+            } else {
+                move(dx, dy, dt)
+            }
         }
     }
 
-    private fun move(dxPx: Float, dyPx: Float) {
-        // px → dp，再套加速曲線：慢速精準、快速跨大距離
+    /**
+     * 觸控 px → dp → 滑鼠 counts。
+     * 預設線性（1dp × 靈敏度），讓主機自己的加速度處理；
+     * 開啟加速度時用「真實時間」算速度（dp/ms），不受觸控事件間隔忽長忽短影響。
+     */
+    private fun move(dxPx: Float, dyPx: Float, dtMs: Long) {
         val dxDp = dxPx / density; val dyDp = dyPx / density
-        val speed = hypot(dxDp, dyDp)
-        val accel = 1f + ((speed - 1.5f) / 6f).coerceIn(0f, 2.5f)
-        accX += dxDp * sensitivity * accel
-        accY += dyDp * sensitivity * accel
+        var gain = sensitivity
+        if (acceleration) {
+            val v = hypot(dxDp, dyDp) / dtMs           // dp/ms，慢速 ~0.1、快速 ~2+
+            gain *= 1f + ((v - 0.3f) / 1.2f).coerceIn(0f, 1.5f)
+        }
+        accX += dxDp * gain
+        accY += dyDp * gain
         val ix = accX.toInt(); val iy = accY.toInt()
         if (ix == 0 && iy == 0) return
         accX -= ix; accY -= iy
@@ -261,5 +285,6 @@ class TouchpadView(context: Context) : View(context) {
     companion object {
         private const val TAP_MS = 220L
         private const val DOUBLE_TAP_MS = 280L
+        private const val START_SLOP_DP = 2.5f
     }
 }

@@ -57,8 +57,9 @@ class MainActivity : Activity(), HidController.Listener {
             }
         }
         touchpad = TouchpadView(this).apply {
-            sensitivity = prefs.getFloat("sens", 1.5f)
+            sensitivity = prefs.getFloat("sens2", 1.2f)
             invertScroll = prefs.getBoolean("invert", false)
+            acceleration = prefs.getBoolean("accel", false)
             visibility = View.GONE
             listener = object : TouchpadView.Listener {
                 override fun onMouseReport(buttons: Int, dx: Int, dy: Int, wheel: Int, pan: Int) =
@@ -261,7 +262,7 @@ class MainActivity : Activity(), HidController.Listener {
                     val v = 0.5f + p / 10f
                     touchpad.sensitivity = v
                     updSens(v)
-                    prefs.edit().putFloat("sens", v).apply()
+                    prefs.edit().putFloat("sens2", v).apply()
                 }
                 override fun onStartTrackingTouch(s: SeekBar) {}
                 override fun onStopTrackingTouch(s: SeekBar) {}
@@ -272,6 +273,13 @@ class MainActivity : Activity(), HidController.Listener {
             isChecked = hid.lowLatency
             setOnCheckedChangeListener { _, c ->
                 hid.lowLatency = c; prefs.edit().putBoolean("lowlat", c).apply()
+            }
+        })
+        box.addView(CheckBox(this).apply {
+            text = "觸控板加速度（iPad 本身已有加速，通常不用開）"
+            isChecked = touchpad.acceleration
+            setOnCheckedChangeListener { _, c ->
+                touchpad.acceleration = c; prefs.edit().putBoolean("accel", c).apply()
             }
         })
         box.addView(CheckBox(this).apply {

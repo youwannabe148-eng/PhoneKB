@@ -386,7 +386,7 @@ class HidController(private val context: Context, private val listener: Listener
 
     companion object {
         private const val KEY_LAST = "last_device"
-        private const val MOUSE_INTERVAL_MS = 12L   // ≈ 83 Hz，接近實體藍牙滑鼠
+        private const val MOUSE_INTERVAL_MS = 8L    // ≈ 125 Hz，和觸控取樣同步，避免一包一筆、一包兩筆的不均勻
         private const val KEEPALIVE_MS = 80L
     }
 }
